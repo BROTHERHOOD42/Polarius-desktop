@@ -1,0 +1,549 @@
+name: Build Desktop
+on:
+    workflow_dispatch:
+        inputs:
+            webapp-version:
+                description: 'Webapp version (e.g., v1.0.0)'
+                required: true
+                type: string
+            webapp-artifact:
+                description: 'Webapp artifact name'
+                required: true
+                type: string
+            release-notes:
+                description: 'Release notes'
+                required: false
+                type: string
+                default: 'Automated release from Polarius-web'
+            release-title:
+                description: 'Release title'
+                required: false
+                type: string
+                default: 'Polarius Desktop'
+
+concurrency: ${{ github.workflow }}-${{ inputs.webapp-version }}
+permissions:
+    contents: write
+    actions: read
+
+jobs:
+    prepare:
+        name: Prepare Build Environment
+        runs-on: ubuntu-24.04
+        outputs:
+            webapp-version: ${{ inputs.webapp-version }}
+            release-notes: ${{ inputs.release-notes }}
+            release-title: ${{ inputs.release-title }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 'lts/*'
+                  cache: 'yarn'
+
+            - name: Install dependencies
+              run: yarn install --frozen-lockfile
+
+            - name: Download webapp artifacts from Polarius-web
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const { owner, repo } = context.repo;
+                      const webRepo = 'Polarius-web';
+                      const webOwner = 'BROTHERHOOD42';
+                      
+                      // Get the latest workflow run from Polarius-web
+                      const runs = await github.rest.actions.listWorkflowRuns({
+                          owner: webOwner,
+                          repo: webRepo,
+                          workflow_id: 'release-webapp.yml',
+                          status: 'completed',
+                          per_page: 10
+                      });
+                      
+                      if (runs.data.workflow_runs.length === 0) {
+                          throw new Error('No completed workflow runs found in Polarius-web');
+                      }
+                      
+                      const latestRun = runs.data.workflow_runs[0];
+                      console.log(`Using workflow run: ${latestRun.id} from ${latestRun.created_at}`);
+                      
+                      // Get artifacts from the latest run
+                      const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                          owner: webOwner,
+                          repo: webRepo,
+                          run_id: latestRun.id
+                      });
+                      
+                      console.log('Available artifacts:', artifacts.data.artifacts.map(a => a.name));
+                      
+                      // Find the webapp artifact
+                      const webappArtifact = artifacts.data.artifacts.find(artifact => 
+                          artifact.name === '${{ inputs.webapp-artifact }}'
+                      );
+                      
+                      if (!webappArtifact) {
+                          throw new Error(`Artifact '${{ inputs.webapp-artifact }}' not found`);
+                      }
+                      
+                      // Download the artifact
+                      const download = await github.rest.actions.downloadArtifact({
+                          owner: webOwner,
+                          repo: webRepo,
+                          artifact_id: webappArtifact.id,
+                          archive_format: 'zip'
+                      });
+                      
+                      const fs = require('fs');
+                      fs.writeFileSync('webapp-artifacts.zip', Buffer.from(download.data));
+                      
+                      console.log('Artifact downloaded successfully');
+              env:
+                  GITHUB_TOKEN: ${{ secrets.WEBAPP_DOWNLOAD_TOKEN }}
+
+            - name: Extract webapp artifacts
+              run: |
+                  unzip webapp-artifacts.zip -d temp/
+                  # Copy webapp folder if it exists
+                  if [ -d "temp/webapp/" ]; then
+                      cp -r temp/webapp/ ./webapp/
+                      echo "webapp/ folder copied successfully"
+                  else
+                      echo "webapp/ folder not found, creating empty directory"
+                      mkdir -p webapp/
+                  fi
+                  # Copy webapp.asar if it exists
+                  if [ -f "temp/webapp.asar" ]; then
+                      cp temp/webapp.asar ./webapp.asar
+                      echo "webapp.asar copied successfully"
+                  else
+                      echo "webapp.asar not found"
+                  fi
+                  rm -rf temp/ webapp-artifacts.zip
+
+            - name: Verify webapp files
+              run: |
+                  echo "Webapp files:"
+                  ls -la webapp/
+                  echo "Webapp.asar:"
+                  ls -la webapp.asar
+                  echo "Webapp.asar size: $(du -h webapp.asar)"
+
+            - name: Update package.json version
+              run: |
+                  VERSION="${{ inputs.webapp-version }}"
+                  # Remove 'v' prefix if present
+                  VERSION=${VERSION#v}
+                  # Update package.json
+                  jq --arg version "$VERSION" '.version = $version' package.json > package.json.tmp
+                  mv package.json.tmp package.json
+                  echo "Updated version to: $VERSION"
+
+            - name: Upload webapp artifacts for build jobs
+              uses: actions/upload-artifact@v4
+              with:
+                  name: webapp-artifacts
+                  path: |
+                      webapp/
+                      webapp.asar
+                      package.json
+                  retention-days: 1
+
+    build-windows:
+        name: Build Windows
+        needs: prepare
+        strategy:
+            matrix:
+                arch: [x64, arm64]
+        runs-on: windows-2022
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 'lts/*'
+                  cache: 'yarn'
+
+            - name: Install dependencies
+              run: yarn install --frozen-lockfile
+
+            - name: Download webapp artifacts from prepare job
+              uses: actions/download-artifact@v4
+              with:
+                  name: webapp-artifacts
+                  path: ./
+
+            - name: Update package.json version
+              run: |
+                  $VERSION = "${{ github.event.inputs.webapp-version }}" -replace '^v', ''
+                  $packageJson = Get-Content package.json | ConvertFrom-Json
+                  $packageJson.version = $VERSION
+                  $packageJson | ConvertTo-Json -Depth 10 | Set-Content package.json
+                  Write-Host "Updated version to: $VERSION"
+
+            - name: Build Windows ${{ matrix.arch }}
+              run: yarn build --win --${{ matrix.arch }} --publish never
+
+            - name: Upload Windows artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: windows-${{ matrix.arch }}-${{ needs.prepare.outputs.webapp-version }}
+                  path: dist/
+                  retention-days: 30
+
+    build-macos:
+        name: Build macOS
+        needs: prepare
+        runs-on: macos-14
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 'lts/*'
+                  cache: 'yarn'
+
+            - name: Install dependencies
+              run: yarn install --frozen-lockfile
+
+            - name: Download webapp artifacts from prepare job
+              uses: actions/download-artifact@v4
+              with:
+                  name: webapp-artifacts
+                  path: ./
+
+            - name: Update package.json version
+              run: |
+                  VERSION="${{ github.event.inputs.webapp-version }}"
+                  VERSION=${VERSION#v}
+                  jq --arg version "$VERSION" '.version = $version' package.json > package.json.tmp
+                  mv package.json.tmp package.json
+                  echo "Updated version to: $VERSION"
+
+            - name: Build macOS Universal
+              run: yarn build:universal --publish never
+
+            - name: Upload macOS artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: macos-${{ needs.prepare.outputs.webapp-version }}
+                  path: dist/
+                  retention-days: 30
+
+    build-linux:
+        name: Build Linux
+        needs: prepare
+        strategy:
+            matrix:
+                arch: [amd64, arm64]
+            fail-fast: false  # ARM64 실패가 AMD64 빌드를 중단하지 않도록
+        runs-on: ubuntu-22.04
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 'lts/*'
+                  cache: 'yarn'
+
+            - name: Install system dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y jq build-essential libsecret-1-dev libsqlcipher-dev
+                  
+                  # Install snapcraft for snap package building (even if it fails for ARM64)
+                  sudo snap install snapcraft --classic || echo "snapcraft installation failed, continuing..."
+                  
+                  # Fix app-builder permissions (will be done after yarn install)
+
+            - name: Install dependencies
+              run: |
+                  # Increase memory limit for ARM64 builds
+                  if [ "${{ matrix.arch }}" = "arm64" ]; then
+                      export NODE_OPTIONS="--max-old-space-size=4096"
+                  fi
+                  yarn install --frozen-lockfile
+                  
+                  # Fix app-builder permissions after installation
+                  find node_modules -name "app-builder" -type f -exec chmod +x {} \; 2>/dev/null || true
+                  find node_modules -path "*/app-builder-bin/*/app-builder" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+            - name: Download webapp artifacts from prepare job
+              uses: actions/download-artifact@v4
+              with:
+                  name: webapp-artifacts
+                  path: ./
+
+            - name: Update package.json version
+              run: |
+                  VERSION="${{ github.event.inputs.webapp-version }}"
+                  VERSION=${VERSION#v}
+                  jq --arg version "$VERSION" '.version = $version' package.json > package.json.tmp
+                  mv package.json.tmp package.json
+                  echo "Updated version to: $VERSION"
+
+            - name: Debug build environment
+              run: |
+                  echo "Architecture: ${{ matrix.arch }}"
+                  echo "Node version: $(node --version)"
+                  echo "Yarn version: $(yarn --version)"
+                  echo "Package.json version: $(jq -r '.version' package.json)"
+                  echo "Webapp directory:"
+                  ls -la webapp/ || echo "Webapp directory not found"
+                  echo "Webapp.asar:"
+                  ls -la webapp.asar || echo "Webapp.asar not found"
+
+            - name: Build Linux ${{ matrix.arch }}
+              run: |
+                  # Set environment variables for build
+                  export NODE_OPTIONS="--max-old-space-size=4096"
+                  export ELECTRON_BUILDER_CACHE="/tmp/electron-builder-cache"
+                  
+                  # Create cache directory
+                  mkdir -p "$ELECTRON_BUILDER_CACHE"
+                  
+                  # Final permission check for app-builder
+                  find node_modules -name "app-builder" -type f -exec chmod +x {} \; 2>/dev/null || true
+                  find node_modules -path "*/app-builder-bin/*/app-builder" -type f -exec chmod +x {} \; 2>/dev/null || true
+                  
+                  # Verify app-builder exists and is executable
+                  if [ -f "node_modules/app-builder-bin/linux/x64/app-builder" ]; then
+                      chmod +x node_modules/app-builder-bin/linux/x64/app-builder
+                      echo "app-builder permissions set"
+                  else
+                      echo "app-builder not found, continuing..."
+                  fi
+                  
+                  echo "Starting Linux ${{ matrix.arch }} build..."
+                  if [ "${{ matrix.arch }}" = "amd64" ]; then
+                      yarn build --linux --x64 --publish never
+                  else
+                      # For ARM64, allow snap build to fail but continue with other targets
+                      yarn build --linux --arm64 --publish never || echo "Build completed with some failures, checking artifacts..."
+                  fi
+                  
+                  echo "Build command completed. Exit code: $?"
+                  echo "Checking if any artifacts were created..."
+
+            - name: Check build artifacts
+              run: |
+                  echo "Checking build artifacts in dist/ directory:"
+                  ls -la dist/ || echo "dist/ directory not found"
+                  echo ""
+                  echo "All files in dist/:"
+                  find dist/ -type f -exec ls -la {} \; 2>/dev/null || echo "No files found in dist/"
+                  echo ""
+                  echo "Looking for specific Linux formats:"
+                  find dist/ -name "*.tar.gz" -exec echo "Found tar.gz: {}" \; -exec ls -la {} \;
+                  find dist/ -name "*.deb" -exec echo "Found deb: {}" \; -exec ls -la {} \;
+                  find dist/ -name "*.AppImage" -exec echo "Found AppImage: {}" \; -exec ls -la {} \;
+                  find dist/ -name "*.snap" -exec echo "Found snap: {}" \; -exec ls -la {} \;
+                  echo ""
+                  echo "Total files found: $(find dist/ -type f | wc -l)"
+
+            - name: Upload Linux artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-${{ matrix.arch }}-${{ needs.prepare.outputs.webapp-version }}
+                  path: dist/
+                  retention-days: 30
+              if: always()  # Upload artifacts even if build partially failed
+
+    create-release:
+        name: Create Release
+        needs: [prepare, build-windows, build-macos, build-linux]
+        runs-on: ubuntu-24.04
+        if: always() && needs.prepare.result == 'success' && (needs.build-windows.result == 'success' || needs.build-macos.result == 'success' || needs.build-linux.result == 'success')
+        steps:
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: artifacts/
+
+            - name: List available files for release
+              run: |
+                  echo "Available artifacts:"
+                  find artifacts/ -type f -name "*.exe" -o -name "*.dmg" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.snap" | sort
+                  echo ""
+                  echo "Windows x64 files:"
+                  find artifacts/windows-x64-*/ -type f -name "*.exe" 2>/dev/null || echo "No Windows x64 files found"
+                  echo ""
+                  echo "Windows ARM64 files:"
+                  find artifacts/windows-arm64-*/ -type f -name "*.exe" 2>/dev/null || echo "No Windows ARM64 files found"
+                  echo ""
+                  echo "macOS files:"
+                  find artifacts/macos-*/ -type f -name "*.dmg" 2>/dev/null || echo "No macOS files found"
+                  echo ""
+                  echo "Linux files:"
+                  find artifacts/linux-*/ -type f \( -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.snap" \) 2>/dev/null || echo "No Linux files found"
+
+            - name: Prepare release files
+              run: |
+                  VERSION="${{ needs.prepare.outputs.webapp-version }}"
+                  VERSION=${VERSION#v}
+                  
+                  # Create clean directory for release files
+                  mkdir -p release-files
+                  
+                  echo "=== Preparing Windows files ==="
+                  # Copy Windows x64 files
+                  if find artifacts/windows-x64-*/ -name "*.exe" -type f | head -1 | grep -q .; then
+                      echo "Found Windows x64 files:"
+                      find artifacts/windows-x64-*/ -name "*.exe" -type f -exec ls -la {} \;
+                      find artifacts/windows-x64-*/ -name "*.exe" -type f -exec cp {} release-files/Polarius-Setup.exe \;
+                      echo "Copied Windows x64 to Polarius-Setup.exe"
+                  else
+                      echo "No Windows x64 files found"
+                  fi
+                  
+                  # Copy Windows ARM64 files
+                  if find artifacts/windows-arm64-*/ -name "*.exe" -type f | head -1 | grep -q .; then
+                      echo "Found Windows ARM64 files:"
+                      find artifacts/windows-arm64-*/ -name "*.exe" -type f -exec ls -la {} \;
+                      find artifacts/windows-arm64-*/ -name "*.exe" -type f -exec cp {} release-files/Polarius-Setup-arm64.exe \;
+                      echo "Copied Windows ARM64 to Polarius-Setup-arm64.exe"
+                  else
+                      echo "No Windows ARM64 files found"
+                  fi
+                  
+                  echo "=== Preparing macOS files ==="
+                  # Copy macOS files
+                  if find artifacts/macos-*/ -name "*.dmg" -type f | head -1 | grep -q .; then
+                      echo "Found macOS files:"
+                      find artifacts/macos-*/ -name "*.dmg" -type f -exec ls -la {} \;
+                      find artifacts/macos-*/ -name "*.dmg" -type f -exec cp {} release-files/Polarius-universal.dmg \;
+                      echo "Copied macOS to Polarius-universal.dmg"
+                  else
+                      echo "No macOS files found"
+                  fi
+                  
+                  echo "=== Preparing Linux files ==="
+                  # Copy Linux AMD64 files (prioritize AppImage, then tar.gz, then deb)
+                  if find artifacts/linux-amd64-*/ -name "*.AppImage" -type f | head -1 | grep -q .; then
+                      echo "Found Linux AMD64 AppImage files:"
+                      find artifacts/linux-amd64-*/ -name "*.AppImage" -type f -exec ls -la {} \;
+                      find artifacts/linux-amd64-*/ -name "*.AppImage" -type f -exec cp {} release-files/Polarius-desktop.AppImage \;
+                      echo "Copied Linux AMD64 AppImage to Polarius-desktop.AppImage"
+                  elif find artifacts/linux-amd64-*/ -name "*.tar.gz" -type f | head -1 | grep -q .; then
+                      echo "Found Linux AMD64 tar.gz files:"
+                      find artifacts/linux-amd64-*/ -name "*.tar.gz" -type f -exec ls -la {} \;
+                      find artifacts/linux-amd64-*/ -name "*.tar.gz" -type f -exec cp {} release-files/Polarius-desktop.tar.gz \;
+                      echo "Copied Linux AMD64 tar.gz to Polarius-desktop.tar.gz"
+                  elif find artifacts/linux-amd64-*/ -name "*.deb" -type f | head -1 | grep -q .; then
+                      echo "Found Linux AMD64 deb files:"
+                      find artifacts/linux-amd64-*/ -name "*.deb" -type f -exec ls -la {} \;
+                      find artifacts/linux-amd64-*/ -name "*.deb" -type f -exec cp {} release-files/Polarius-desktop.deb \;
+                      echo "Copied Linux AMD64 deb to Polarius-desktop.deb"
+                  else
+                      echo "No Linux AMD64 files found"
+                  fi
+                  
+                  # Copy Linux ARM64 files (prioritize AppImage, then tar.gz, then deb)
+                  if find artifacts/linux-arm64-*/ -name "*.AppImage" -type f | head -1 | grep -q .; then
+                      echo "Found Linux ARM64 AppImage files:"
+                      find artifacts/linux-arm64-*/ -name "*.AppImage" -type f -exec ls -la {} \;
+                      find artifacts/linux-arm64-*/ -name "*.AppImage" -type f -exec cp {} release-files/Polarius-desktop-arm64.AppImage \;
+                      echo "Copied Linux ARM64 AppImage to Polarius-desktop-arm64.AppImage"
+                  elif find artifacts/linux-arm64-*/ -name "*.tar.gz" -type f | head -1 | grep -q .; then
+                      echo "Found Linux ARM64 tar.gz files:"
+                      find artifacts/linux-arm64-*/ -name "*.tar.gz" -type f -exec ls -la {} \;
+                      find artifacts/linux-arm64-*/ -name "*.tar.gz" -type f -exec cp {} release-files/Polarius-desktop-arm64.tar.gz \;
+                      echo "Copied Linux ARM64 tar.gz to Polarius-desktop-arm64.tar.gz"
+                  elif find artifacts/linux-arm64-*/ -name "*.deb" -type f | head -1 | grep -q .; then
+                      echo "Found Linux ARM64 deb files:"
+                      find artifacts/linux-arm64-*/ -name "*.deb" -type f -exec ls -la {} \;
+                      find artifacts/linux-arm64-*/ -name "*.deb" -type f -exec cp {} release-files/Polarius-desktop-arm64.deb \;
+                      echo "Copied Linux ARM64 deb to Polarius-desktop-arm64.deb"
+                  else
+                      echo "No Linux ARM64 files found"
+                  fi
+                  
+                  echo "=== Final release files ==="
+                  ls -la release-files/
+                  echo "Total files: $(ls release-files/ | wc -l)"
+
+            - name: Generate release notes
+              run: |
+                  VERSION="${{ needs.prepare.outputs.webapp-version }}"
+                  
+                  # Create release notes file
+                  cat > release-notes.md << EOF
+                  ## ${{ needs.prepare.outputs.release-title }}
+                  
+                  ${{ needs.prepare.outputs.release-notes }}
+                  
+                  ### Downloads
+                  
+                  EOF
+                  
+                  # Add Windows downloads
+                  echo "**Windows:**" >> release-notes.md
+                  if [ -f "release-files/Polarius-Setup.exe" ]; then
+                      echo "- [Polarius Setup (x64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-Setup.exe)" >> release-notes.md
+                  fi
+                  if [ -f "release-files/Polarius-Setup-arm64.exe" ]; then
+                      echo "- [Polarius Setup (ARM64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-Setup-arm64.exe)" >> release-notes.md
+                  fi
+                  echo "" >> release-notes.md
+                  
+                  # Add macOS downloads
+                  echo "**macOS:**" >> release-notes.md
+                  if [ -f "release-files/Polarius-universal.dmg" ]; then
+                      echo "- [Polarius.dmg](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-universal.dmg)" >> release-notes.md
+                  fi
+                  echo "" >> release-notes.md
+                  
+                  # Add Linux downloads
+                  echo "**Linux:**" >> release-notes.md
+                  if [ -f "release-files/Polarius-desktop.AppImage" ]; then
+                      echo "- [Polarius (AMD64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-desktop.AppImage) (AppImage)" >> release-notes.md
+                  fi
+                  if [ -f "release-files/Polarius-desktop.tar.gz" ]; then
+                      echo "- [Polarius (AMD64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-desktop.tar.gz) (tar.gz)" >> release-notes.md
+                  fi
+                  if [ -f "release-files/Polarius-desktop.deb" ]; then
+                      echo "- [Polarius (AMD64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-desktop.deb) (deb)" >> release-notes.md
+                  fi
+                  if [ -f "release-files/Polarius-desktop-arm64.AppImage" ]; then
+                      echo "- [Polarius (ARM64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-desktop-arm64.AppImage) (AppImage)" >> release-notes.md
+                  fi
+                  if [ -f "release-files/Polarius-desktop-arm64.tar.gz" ]; then
+                      echo "- [Polarius (ARM64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-desktop-arm64.tar.gz) (tar.gz)" >> release-notes.md
+                  fi
+                  if [ -f "release-files/Polarius-desktop-arm64.deb" ]; then
+                      echo "- [Polarius (ARM64)](https://github.com/BROTHERHOOD42/Polarius-desktop/releases/download/$VERSION/Polarius-desktop-arm64.deb) (deb)" >> release-notes.md
+                  fi
+                  echo "" >> release-notes.md
+                  
+                  # Add changes section
+                  cat >> release-notes.md << EOF
+                  ### Changes
+                  - Updated webapp to $VERSION
+                  - Multi-platform support (Windows x64/ARM64, macOS Universal, Linux AMD64/ARM64)
+                  EOF
+                  
+                  echo "Generated release notes:"
+                  cat release-notes.md
+
+            - name: Create Release
+              uses: softprops/action-gh-release@v1
+              with:
+                  tag_name: ${{ needs.prepare.outputs.webapp-version }}
+                  name: ${{ needs.prepare.outputs.release-title }}
+                  body_path: release-notes.md
+                  files: |
+                      release-files/*
+                  fail_on_unmatched_files: false
+                  draft: false
+                  prerelease: false
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
